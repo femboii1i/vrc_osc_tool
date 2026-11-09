@@ -43,7 +43,7 @@ Aktuell wird nur Linux aktiv unterstützt. Der Windows-Zweig (SMTC über `winsdk
 ## Autor
 
 - VRChat: `:femboii1i`
-- Discord: `evil femboy`
+- Discord: `finn454454`
 
 ## Lizenz
 
