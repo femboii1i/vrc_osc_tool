@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VRC OSC Tool
+Comment=OSC-Tool für VRChat (Spotify, Chatbox, Parameter)
+# Pfad anpassen und Datei nach ~/.local/share/applications/ kopieren
+Exec=/PFAD/ZU/vrc-osc-tool/start.sh
+Terminal=false
+Categories=Utility;Game;
