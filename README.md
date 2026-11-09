@@ -1,6 +1,7 @@
 # VRC OSC Tool
 
 Modernes OSC-Tool für VRChat im VRChat-Menü-Look, gebaut mit Python und customtkinter.
+**Nur für Windows.**
 
 ## Features
 
@@ -12,38 +13,44 @@ Modernes OSC-Tool für VRChat im VRChat-Menü-Look, gebaut mit Python und custom
 - **Monitor:** eingehende OSC-Nachrichten live ansehen
 - **Aussehen:** Paletten (VRChat, Dunkel, AMOLED, Hell), Akzentfarben, Templates
 
-Die Spotify-Erkennung braucht keine API-Keys oder Logins und funktioniert mit der Spotify-Desktop-App.
+Die Spotify-Erkennung braucht keine API-Keys oder Logins und funktioniert mit der Spotify-Desktop-App
+(über die Windows-Mediensteuerung).
 
-## Installation (Linux)
+## Installation
 
-```bash
+1. [Python 3.12](https://www.python.org/downloads/) installieren (beim Installer **"Add python.exe to PATH"** anhaken)
+2. Repo als ZIP herunterladen (grüner Button **Code** → **Download ZIP**) und entpacken
+3. **`start.bat`** doppelklicken. Beim ersten Start werden die Pakete automatisch installiert.
+
+Oder per Terminal:
+
+```bat
 git clone https://github.com/DEIN-NAME/vrc-osc-tool.git
 cd vrc-osc-tool
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 python vrc_osc_tool.py
 ```
 
-Oder einfach `./start.sh` ausführen, das legt die venv beim ersten Start selbst an.
-Für einen Starter im Anwendungsmenü: `vrc-osc-tool.desktop` anpassen und nach `~/.local/share/applications/` kopieren.
+### Als .exe bauen (optional)
 
-Voraussetzungen: Python 3.9+, Tkinter (z. B. `sudo dnf install python3-tkinter`),
-`busctl` (bei den meisten Distributionen vorinstalliert). `playerctl` wird nur als Fallback genutzt.
+`build_exe.bat` doppelklicken. Danach liegt `dist\VRC-OSC-Tool.exe` bereit.
 
 ## VRChat einrichten
 
 Action Menu → Options → OSC → **Enabled**.
 Standard-Ports: `9000` (VRChat empfängt) und `9001` (VRChat sendet).
 
-## Hinweis
+## Hinweise
 
-Aktuell wird nur Linux aktiv unterstützt. Der Windows-Zweig (SMTC über `winsdk`) ist enthalten, aber ungetestet.
+- Python 3.12 wird empfohlen, weil `winsdk` für neuere Versionen teils keine fertigen Pakete hat.
+- Windows fragt beim ersten Start evtl. nach einer Firewall-Freigabe (für den OSC-Empfang auf Port 9001).
 
 ## Autor
 
 - VRChat: `:femboii1i`
-- Discord: `finn454454`
+- Discord: `evil femboy`
 
 ## Lizenz
 

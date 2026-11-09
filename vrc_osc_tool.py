@@ -18,10 +18,8 @@ Installation:
 In VRChat: Action Menu -> Options -> OSC -> Enabled
 
 Die Spotify-Erkennung braucht KEINE API-Keys oder Logins und funktioniert
-mit der Spotify-Desktop-App:
-  * Windows: liest die Mediensteuerung (SMTC) über das Paket 'winsdk'
-  * Linux:   liest MPRIS direkt über D-Bus (busctl, bei Fedora & Co. vorinstalliert),
-             'playerctl' wird nur als Fallback genutzt
+mit der Spotify-Desktop-App (Windows-Mediensteuerung SMTC über das Paket 'winsdk').
+Nur Windows.
 """
 
 import asyncio
@@ -32,8 +30,6 @@ import os
 import queue
 import random
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -55,7 +51,6 @@ except ImportError as exc:  # pragma: no cover
     sys.exit(f"Fehlendes Paket ({exc.name}). Bitte ausführen: pip install -r requirements.txt")
 
 IS_WINDOWS = sys.platform == "win32"
-IS_LINUX = sys.platform.startswith("linux")
 try:
     from winsdk.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as MediaManager,
@@ -454,15 +449,12 @@ class MediaWatcher(threading.Thread):
         self.only_spotify = only_spotify
         self._halt = threading.Event()
         self.lock = threading.Lock()
-        if IS_WINDOWS:
-            err = None if HAS_WINSDK else "Paket 'winsdk' fehlt: pip install winsdk (bei Fehlern Python 3.12 nutzen)."
-        elif IS_LINUX:
-            err = None if (shutil.which("busctl") or shutil.which("playerctl")) else (
-                "Weder 'busctl' noch 'playerctl' gefunden. Installieren: sudo dnf install playerctl "
-                "(Debian/Ubuntu: sudo apt install playerctl)"
-            )
+        if not IS_WINDOWS:
+            err = "Dieses Tool läuft nur unter Windows."
+        elif not HAS_WINSDK:
+            err = "Paket 'winsdk' fehlt: pip install winsdk (bei Fehlern Python 3.12 nutzen)."
         else:
-            err = "Die Spotify-Erkennung funktioniert nur unter Windows und Linux."
+            err = None
         self.state = {
             "error": err,
             "active": False,
@@ -488,141 +480,10 @@ class MediaWatcher(threading.Thread):
         if self.state["error"]:
             return
         try:
-            if IS_WINDOWS:
-                asyncio.run(self._loop())
-            else:
-                self._run_linux()
+            asyncio.run(self._loop())
         except Exception as exc:  # noqa: BLE001
             with self.lock:
                 self.state["error"] = f"Media-Watcher abgestürzt: {exc}"
-
-    # ---- Linux: MPRIS über playerctl
-    @staticmethod
-    def _fetch_art_url(url):
-        if not url:
-            return None
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                return Image.open(io.BytesIO(resp.read())).convert("RGB")
-        except Exception:  # noqa: BLE001
-            return None
-
-    @staticmethod
-    def _unwrap(v):
-        """Entfernt die {"type":..,"data":..}-Hüllen aus busctl --json."""
-        if isinstance(v, dict):
-            if set(v.keys()) == {"type", "data"}:
-                return MediaWatcher._unwrap(v["data"])
-            return {k: MediaWatcher._unwrap(x) for k, x in v.items()}
-        if isinstance(v, list):
-            return [MediaWatcher._unwrap(x) for x in v]
-        return v
-
-    def _read_busctl(self):
-        """MPRIS direkt über D-Bus (busctl ist bei systemd-Distros wie Fedora dabei)."""
-        base = ["busctl", "--user"]
-        out = subprocess.run(base + ["--no-legend", "list"], capture_output=True, text=True, timeout=3).stdout
-        names = [ln.split()[0] for ln in out.splitlines() if ln.startswith("org.mpris.MediaPlayer2.")]
-        if self.only_spotify:
-            names = [n for n in names if "spotify" in n.lower()]
-        best = None
-        for name in names:
-            res = subprocess.run(
-                base + ["--json=short", "call", name, "/org/mpris/MediaPlayer2",
-                        "org.freedesktop.DBus.Properties", "GetAll", "s", "org.mpris.MediaPlayer2.Player"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if res.returncode != 0:
-                continue
-            data = self._unwrap(json.loads(res.stdout))
-            props = data[0] if isinstance(data, list) and data else data
-            if not isinstance(props, dict):
-                continue
-            md = props.get("Metadata") or {}
-            if not isinstance(md, dict):
-                md = {}
-            artist = md.get("xesam:artist", "")
-            if isinstance(artist, list):
-                artist = ", ".join(str(a) for a in artist)
-            row = [
-                str(props.get("PlaybackStatus", "")),
-                str(md.get("xesam:title", "")),
-                str(artist),
-                str(md.get("xesam:album", "")),
-                str(md.get("mpris:length", 0)),
-                str(props.get("Position", 0)),
-                str(md.get("mpris:artUrl", "")),
-            ]
-            if best is None or row[0] == "Playing":
-                best = row
-            if row[0] == "Playing":
-                break
-        return best
-
-    def _read_playerctl(self):
-        fmt = "{{status}}\t{{title}}\t{{artist}}\t{{album}}\t{{mpris:length}}\t{{position}}\t{{mpris:artUrl}}"
-        cmd = ["playerctl"] + (["-p", "spotify"] if self.only_spotify else []) + ["metadata", "--format", fmt]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
-        if res.returncode == 0 and res.stdout.strip():
-            return res.stdout.rstrip("\n").split("\t")
-        return None
-
-    def _read_linux(self):
-        if shutil.which("busctl"):
-            try:
-                row = self._read_busctl()
-                if row:
-                    return row
-            except Exception:  # noqa: BLE001
-                pass
-        if shutil.which("playerctl"):
-            try:
-                return self._read_playerctl()
-            except Exception:  # noqa: BLE001
-                return None
-        return None
-
-    def _run_linux(self):
-        last_key = None
-        art_version = 0
-        while not self._halt.is_set():
-            parts = self._read_linux()
-
-            if not parts or len(parts) < 7:
-                with self.lock:
-                    self.state.update(active=False, playing=False)
-                last_key = None
-            else:
-                status, title, artist, album, length, position, art_url = parts[:7]
-
-                def to_sec(v):
-                    try:
-                        return max(0.0, int(v) / 1_000_000)
-                    except ValueError:
-                        return 0.0
-
-                key = (title, artist, album)
-                art, art_changed = None, False
-                if key != last_key:
-                    art = self._fetch_art_url(art_url)
-                    art_version += 1
-                    art_changed = True
-                    last_key = key
-                with self.lock:
-                    self.state.update(
-                        active=bool(title or artist),
-                        playing=status.strip().lower() == "playing",
-                        title=title,
-                        artist=artist,
-                        album=album,
-                        pos=to_sec(position),
-                        dur=to_sec(length),
-                        app="spotify",
-                    )
-                    if art_changed:
-                        self.state["art"] = art
-                        self.state["art_version"] = art_version
-            self._halt.wait(0.8)
 
     def _pick(self, mgr):
         sessions = list(mgr.get_sessions())
