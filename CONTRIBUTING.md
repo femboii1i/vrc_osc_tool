@@ -7,4 +7,4 @@ Pull Requests und Ideen sind willkommen.
 3. Mit einer klaren Beschreibung einen Pull Request öffnen
 
 Bugs und Wünsche bitte als Issue mit dem passenden Template melden.
-Kontakt: Discord `evil femboy`.
+Kontakt: Discord `finn454454`.
