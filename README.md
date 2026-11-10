@@ -17,7 +17,7 @@ Die Spotify-Erkennung braucht keine API-Keys oder Logins und funktioniert mit de
 ## Installation (Linux)
 
 ```bash
-git clone https://github.com/DEIN-NAME/vrc-osc-tool.git
+git clone https://github.com/femboii1i/vrc-osc-tool.git
 cd vrc-osc-tool
 python3 -m venv .venv
 source .venv/bin/activate
