@@ -1,4 +1,8 @@
-customtkinter>=5.2
-Pillow>=10.0
-python-osc>=1.8
-winsdk>=1.0.0b10
+python-osc
+customtkinter
+pillow
+winrt-runtime; sys_platform == "win32"
+winrt-Windows.Foundation; sys_platform == "win32"
+winrt-Windows.Foundation.Collections; sys_platform == "win32"
+winrt-Windows.Media.Control; sys_platform == "win32"
+winrt-Windows.Storage.Streams; sys_platform == "win32"

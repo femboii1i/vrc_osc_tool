@@ -2,10 +2,10 @@
 """
 VRC OSC Tool
 ------------
-(c) 2026 VRChat: :femboii1i  |  Discord: evil femboy
+(c) 2026 VRChat: :femboii1i  |  Discord: finn454454
 
 Modernes Tool für VRChat OSC:
-  * Spotify:   Now Playing (Cover, Titel, Fortschritt) + automatisch in die Chatbox
+  * Musik:     Spotify / YouTube Music Now Playing (Cover, Titel, Fortschritt) + automatisch in die Chatbox
                inkl. synchroner Lyrics (zur Laufzeit von LRCLIB geladen)
   * Uhr:       Uhrzeit/Datum in der Chatbox (wenn keine Musik läuft)
   * Furry-Detektor: Zufalls-Spaßscan, per Button oder Avatar-Parameter
@@ -17,9 +17,11 @@ Installation:
   pip install -r requirements.txt
 In VRChat: Action Menu -> Options -> OSC -> Enabled
 
-Die Spotify-Erkennung braucht KEINE API-Keys oder Logins und funktioniert
-mit der Spotify-Desktop-App (Windows-Mediensteuerung SMTC über das Paket 'winsdk').
-Nur Windows.
+Die Musik-Erkennung braucht KEINE API-Keys oder Logins. Unterstützt werden Spotify,
+YouTube Music (Browser oder Desktop-App) und beliebige Mediaplayer:
+  * Windows: liest die Mediensteuerung (SMTC) über das Paket 'winrt' (Fallback: 'winsdk')
+  * Linux:   liest MPRIS direkt über D-Bus (busctl, bei Fedora & Co. vorinstalliert),
+             'playerctl' wird nur als Fallback genutzt
 """
 
 import asyncio
@@ -30,6 +32,8 @@ import os
 import queue
 import random
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -51,28 +55,61 @@ except ImportError as exc:  # pragma: no cover
     sys.exit(f"Fehlendes Paket ({exc.name}). Bitte ausführen: pip install -r requirements.txt")
 
 IS_WINDOWS = sys.platform == "win32"
-try:
-    from winsdk.windows.media.control import (
-        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
-    )
-    from winsdk.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+IS_LINUX = sys.platform.startswith("linux")
+HAS_WINSDK = False  # Name bleibt aus Kompatibilität: True, sobald winrt ODER winsdk geladen wurde
+HAS_ART = False
+if IS_WINDOWS:
+    # 1) 'winrt' (aktiv gepflegt, läuft auch mit neuen Python-Versionen), 2) 'winsdk' als Fallback
+    for _pkg in ("winrt", "winsdk"):
+        try:
+            _ctl = __import__(f"{_pkg}.windows.media.control", fromlist=["x"])
+            MediaManager = _ctl.GlobalSystemMediaTransportControlsSessionManager
+            PlaybackStatus = _ctl.GlobalSystemMediaTransportControlsSessionPlaybackStatus
+            HAS_WINSDK = True
+        except Exception:  # noqa: BLE001
+            continue
+        try:  # Cover-Unterstützung ist optional: ohne sie funktionieren Titel/Artist trotzdem
+            _streams = __import__(f"{_pkg}.windows.storage.streams", fromlist=["x"])
+            Buffer, DataReader, InputStreamOptions = _streams.Buffer, _streams.DataReader, _streams.InputStreamOptions
+            HAS_ART = True
+        except Exception:  # noqa: BLE001
+            pass
+        break
 
-    HAS_WINSDK = True
-except Exception:
-    HAS_WINSDK = False
+WIN_PIP_HINT = (
+    "Windows-Medienerkennung fehlt. Im Tool-Ordner ausführen:\n"
+    f'"{sys.executable}" -m pip install winrt-runtime winrt-Windows.Media.Control '
+    "winrt-Windows.Storage.Streams winrt-Windows.Foundation winrt-Windows.Foundation.Collections\n"
+    "(oder einfach start.bat benutzen)"
+)
 
 # ----------------------------------------------------------------- Konstanten
 CONFIG_FILE = Path.home() / ".vrc_osc_tool.json"
 CHATBOX_LIMIT = 144
+QUICK_TEXTS = ["👋 Hallo!", "BRB", "AFK", "GG", "Danke ❤", "😂"]
 CHATBOX_MIN_GAP = 1.6  # VRChat limitiert die Chatbox auf ca. 1 Nachricht / 1,5 s
 MONITOR_MAX_LINES = 1000
 DEFAULT_TEMPLATE = "🎵 {artist} – {title}\n{bar} {pos}/{dur}"
 
-APP_VERSION = "3.1"
+APP_VERSION = "2.0"
+SOURCES = ("Spotify", "YouTube Music", "Beliebig")
+# Fenster-IDs (SMTC) für die Quellenerkennung
+YTM_DESKTOP_IDS = ("youtube", "ytmusic", "pear", "th-ch")
+YTM_MPRIS_IDS = YTM_DESKTOP_IDS + ("chromium", "chrome", "firefox", "brave", "edge", "opera", "vivaldi", "zen")
+BROWSER_IDS = ("chrome", "msedge", "edge", "firefox", "brave", "opera", "vivaldi", "chromium", "zen")
 AUTHOR_VRC = ":femboii1i"
-AUTHOR_DISCORD = "evil femboy"
+AUTHOR_DISCORD = "finn454454"
 COPYRIGHT = f"© {time.strftime('%Y')} VRChat: {AUTHOR_VRC}  ·  Discord: {AUTHOR_DISCORD}"
+COPYRIGHT_SHORT = f"© {time.strftime('%Y')} VRChat {AUTHOR_VRC} · Discord {AUTHOR_DISCORD}"
+# Eigene Farbe pro Seite (Tab-Unterstrich, Farbstreifen, Überschriften)
+PAGE_COLORS = {
+    "spotify": "#1db954", "chat": "#4aa3ff", "clock": "#f5b83d", "furry": "#ff6fb5",
+    "params": "#a66bff", "monitor": "#22d3c5", "look": "#ff8a3d", "settings": "#b9a572",
+}
+NAV_SHORT = {
+    "spotify": ("🎵", "MUSIK"), "chat": ("💬", "CHAT"), "clock": ("🕐", "UHR"), "furry": ("🐾", "FURRY"),
+    "params": ("🎛", "PARAMS"), "monitor": ("📡", "MONITOR"), "look": ("🎨", "LOOK"), "settings": ("⚙", "OPTIONEN"),
+}
 
 # --- Theme: Diese Werte werden von apply_theme() beim Start / bei "Anwenden" überschrieben
 BG = "#121212"
@@ -93,13 +130,43 @@ ART_FG = "#555555"
 ACCENT = "#1DB954"
 ACCENT_HOVER = "#1ed760"
 ON_ACCENT = "black"
-CARD_RADIUS = 20
-INNER_RADIUS = 16
+CARD_RADIUS = 2
+INNER_RADIUS = 0
 SIDEBAR_W = 200
 WARN = "#f0a030"
 DANGER = "#e5484d"
 
 PALETTES = {
+    "Tarkov": dict(
+        MODE="dark", BG="#141414", SIDEBAR="#0d0d0d", CARD="#1e1e1c", CARD_INNER="#151514", NEUTRAL="#2c2c29",
+        NEUTRAL_HOVER="#3b3b36", ROW="#232321", ROW_HOVER="#2e2e2b", NAV_ACTIVE="#2a2822", TEXT_DIM="#8a8678",
+        TEXT_MAIN="#c9c5b5", TEXT_SOFT="#b5b1a2", TEXT_LYRIC="#dcd7c4", TRACK="#44423b", ART_FG="#55534a",
+    ),
+    "Neon": dict(
+        MODE="dark", BG="#0e0a1a", SIDEBAR="#090614", CARD="#181230", CARD_INNER="#110c24", NEUTRAL="#2a2150",
+        NEUTRAL_HOVER="#3a2f6b", ROW="#1d1638", ROW_HOVER="#2a2150", NAV_ACTIVE="#241a4a", TEXT_DIM="#8f84c0",
+        TEXT_MAIN="#e6e0ff", TEXT_SOFT="#cbc3f0", TEXT_LYRIC="#f3f0ff", TRACK="#3b2f6e", ART_FG="#5a4d96",
+    ),
+    "Wald": dict(
+        MODE="dark", BG="#0d1410", SIDEBAR="#080e0b", CARD="#15211a", CARD_INNER="#0f1913", NEUTRAL="#22362a",
+        NEUTRAL_HOVER="#2f4a39", ROW="#1a2a20", ROW_HOVER="#243a2c", NAV_ACTIVE="#1d3326", TEXT_DIM="#7fa08a",
+        TEXT_MAIN="#d9eadf", TEXT_SOFT="#bfd8c7", TEXT_LYRIC="#eaf6ee", TRACK="#2f4a39", ART_FG="#4d6b58",
+    ),
+    "Blut": dict(
+        MODE="dark", BG="#150a0a", SIDEBAR="#0d0606", CARD="#221212", CARD_INNER="#180c0c", NEUTRAL="#3a1d1d",
+        NEUTRAL_HOVER="#522828", ROW="#2a1515", ROW_HOVER="#3a1d1d", NAV_ACTIVE="#341919", TEXT_DIM="#b08585",
+        TEXT_MAIN="#f0dcdc", TEXT_SOFT="#dcbcbc", TEXT_LYRIC="#fbeaea", TRACK="#523030", ART_FG="#7a4a4a",
+    ),
+    "Ozean": dict(
+        MODE="dark", BG="#08121c", SIDEBAR="#050c14", CARD="#0f2030", CARD_INNER="#0a1824", NEUTRAL="#1a3550",
+        NEUTRAL_HOVER="#25486a", ROW="#132a40", ROW_HOVER="#1c3a58", NAV_ACTIVE="#16304a", TEXT_DIM="#7fa3c4",
+        TEXT_MAIN="#dcebf8", TEXT_SOFT="#bcd4ea", TEXT_LYRIC="#ecf5fc", TRACK="#27415c", ART_FG="#486888",
+    ),
+    "Sakura": dict(
+        MODE="dark", BG="#1a0f16", SIDEBAR="#120911", CARD="#2a1824", CARD_INNER="#201119", NEUTRAL="#42263a",
+        NEUTRAL_HOVER="#5a3550", ROW="#321d2b", ROW_HOVER="#42263a", NAV_ACTIVE="#3a2133", TEXT_DIM="#c294b0",
+        TEXT_MAIN="#f8e3ee", TEXT_SOFT="#e8c6d9", TEXT_LYRIC="#fff0f7", TRACK="#5a3550", ART_FG="#855876",
+    ),
     "VRChat": dict(
         MODE="dark", BG="#0b1218", SIDEBAR="#070d12", CARD="#15222c", CARD_INNER="#0e1a22", NEUTRAL="#223441",
         NEUTRAL_HOVER="#2e4658", ROW="#1a2a36", ROW_HOVER="#243947", NAV_ACTIVE="#1c3340", TEXT_DIM="#7f98a8",
@@ -121,7 +188,22 @@ PALETTES = {
         TEXT_MAIN="#2a2a32", TEXT_SOFT="#3a3a44", TEXT_LYRIC="#1a1a20", TRACK="#cfcfd8", ART_FG="#aaaaaa",
     ),
 }
+# Passende Akzentfarbe je Farbschema (wird beim Anklicken automatisch gesetzt)
+PAL_ACCENT = {
+    "Tarkov": "#b9a572", "Neon": "#a66bff", "Wald": "#5fbf7a", "Blut": "#d9423a", "Ozean": "#3b9eff",
+    "Sakura": "#ff8fc0", "VRChat": "#1fc8d4", "Dunkel": "#1DB954", "AMOLED": "#1DB954", "Hell": "#2f7de1",
+}
 ACCENTS = {
+    "Mint": "#3ee0b0",
+    "Sakura-Rosa": "#ff8fc0",
+    "Limette": "#a6e22e",
+    "Gold": "#e6b800",
+    "Eisblau": "#8fd3ff",
+    "Lava": "#ff5a1f",
+    "Tarkov-Khaki": "#b9a572",
+    "Tarkov-Orange": "#d9822b",
+    "Tarkov-Oliv": "#8d9a58",
+    "Tarkov-Rot": "#b5413a",
     "VRChat-Cyan": "#1fc8d4",
     "Spotify-Grün": "#1DB954",
     "Neon-Pink": "#ff4fa3",
@@ -164,13 +246,14 @@ DEFAULT_CONFIG = {
     "scan_param": "FurryScan",
     "scan_param_on": False,
     "scan_name": "",
-    "palette": "VRChat",
-    "accent": "#1fc8d4",
-    "card_radius": 20,
+    "palette": "Tarkov",
+    "accent": "#b9a572",
+    "card_radius": 2,
     "ui_scale": 1.0,
     "opacity": 1.0,
     "compact_sidebar": False,
     "hidden_pages": [],
+    "colorful": True,
     "start_page": "",
 }
 
@@ -228,20 +311,49 @@ def on_color(h):
 
 def apply_theme(cfg):
     """Setzt die globalen Theme-Variablen aus der Config. Danach muss die UI neu gebaut werden."""
-    pal = PALETTES.get(cfg.get("palette"), PALETTES["VRChat"])
-    accent = cfg.get("accent") if _HEX_RE.match(str(cfg.get("accent", ""))) else "#1fc8d4"
+    pal = PALETTES.get(cfg.get("palette"), PALETTES["Tarkov"])
+    accent = cfg.get("accent") if _HEX_RE.match(str(cfg.get("accent", ""))) else "#b9a572"
     g = globals()
     for key, value in pal.items():
         if key != "MODE":
             g[key] = value
     g["ACCENT"], g["ACCENT_HOVER"], g["ON_ACCENT"] = accent, lighten(accent), on_color(accent)
-    radius = max(4, min(30, int(cfg.get("card_radius", 14))))
-    g["CARD_RADIUS"], g["INNER_RADIUS"] = radius, max(4, radius - 4)
+    radius = max(0, min(30, int(cfg.get("card_radius", 2))))
+    g["CARD_RADIUS"], g["INNER_RADIUS"] = radius, max(0, radius - 4)
     g["SIDEBAR_W"] = 72 if cfg.get("compact_sidebar") else 200
     ctk.set_appearance_mode("light" if pal["MODE"] == "light" else "dark")
     try:
         for widget in ("CTkButton", "CTkEntry", "CTkSegmentedButton"):
-            ctk.ThemeManager.theme[widget]["corner_radius"] = max(6, radius - 2)
+            ctk.ThemeManager.theme[widget]["corner_radius"] = max(0, radius - 2)
+    except Exception:  # noqa: BLE001
+        pass
+    # Einheitlicher Look für alle Standard-Widgets (Buttons, Eingaben, Schalter, Slider ...)
+    th, r = ctk.ThemeManager.theme, max(0, radius - 2)
+    looks = {
+        "CTkButton": dict(corner_radius=r, border_width=1, border_color=g["TRACK"], fg_color=g["NEUTRAL"],
+                          hover_color=g["NEUTRAL_HOVER"], text_color=g["TEXT_MAIN"]),
+        "CTkEntry": dict(corner_radius=r, border_width=1, border_color=g["TRACK"], fg_color=g["CARD_INNER"],
+                         text_color=g["TEXT_MAIN"]),
+        "CTkTextbox": dict(corner_radius=r, border_width=1, border_color=g["TRACK"], fg_color=g["CARD_INNER"],
+                           text_color=g["TEXT_MAIN"], scrollbar_button_color=g["TRACK"],
+                           scrollbar_button_hover_color=g["NEUTRAL_HOVER"]),
+        "CTkSwitch": dict(progress_color=accent, fg_color=g["TRACK"], button_color=g["TEXT_SOFT"],
+                          button_hover_color=g["TEXT_MAIN"], text_color=g["TEXT_MAIN"]),
+        "CTkSlider": dict(progress_color=accent, button_color=accent, button_hover_color=g["ACCENT_HOVER"],
+                          fg_color=g["TRACK"]),
+        "CTkProgressBar": dict(progress_color=accent, fg_color=g["TRACK"]),
+        "CTkOptionMenu": dict(corner_radius=r, fg_color=g["NEUTRAL"], button_color=g["NEUTRAL_HOVER"],
+                              button_hover_color=g["TRACK"], text_color=g["TEXT_MAIN"]),
+        "CTkScrollbar": dict(button_color=g["TRACK"], button_hover_color=g["NEUTRAL_HOVER"]),
+        "CTkLabel": dict(text_color=g["TEXT_MAIN"]),
+    }
+    for widget, vals in looks.items():
+        try:
+            th[widget].update(vals)
+        except Exception:  # noqa: BLE001
+            pass
+    try:  # Bahnschrift (Windows) kommt der Tarkov-Schrift am nächsten
+        ctk.ThemeManager.theme["CTkFont"]["Windows"]["family"] = "Bahnschrift"
     except Exception:  # noqa: BLE001
         pass
 
@@ -444,17 +556,20 @@ class LyricsFetcher:
 class MediaWatcher(threading.Thread):
     """Liest im Hintergrund die Windows-Mediensteuerung (SMTC) aus."""
 
-    def __init__(self, only_spotify=True):
+    def __init__(self, source="Spotify"):
         super().__init__(daemon=True)
-        self.only_spotify = only_spotify
+        self.source = source
         self._halt = threading.Event()
         self.lock = threading.Lock()
-        if not IS_WINDOWS:
-            err = "Dieses Tool läuft nur unter Windows."
-        elif not HAS_WINSDK:
-            err = "Paket 'winsdk' fehlt: pip install winsdk (bei Fehlern Python 3.12 nutzen)."
+        if IS_WINDOWS:
+            err = None if HAS_WINSDK else WIN_PIP_HINT
+        elif IS_LINUX:
+            err = None if (shutil.which("busctl") or shutil.which("playerctl")) else (
+                "Weder 'busctl' noch 'playerctl' gefunden. Installieren: sudo dnf install playerctl "
+                "(Debian/Ubuntu: sudo apt install playerctl)"
+            )
         else:
-            err = None
+            err = "Die Musik-Erkennung funktioniert nur unter Windows und Linux."
         self.state = {
             "error": err,
             "active": False,
@@ -480,24 +595,180 @@ class MediaWatcher(threading.Thread):
         if self.state["error"]:
             return
         try:
-            asyncio.run(self._loop())
+            if IS_WINDOWS:
+                asyncio.run(self._loop())
+            else:
+                self._run_linux()
         except Exception as exc:  # noqa: BLE001
             with self.lock:
                 self.state["error"] = f"Media-Watcher abgestürzt: {exc}"
 
+    # ---- Linux: MPRIS über playerctl
+    @staticmethod
+    def _fetch_art_url(url):
+        if not url:
+            return None
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return Image.open(io.BytesIO(resp.read())).convert("RGB")
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _unwrap(v):
+        """Entfernt die {"type":..,"data":..}-Hüllen aus busctl --json."""
+        if isinstance(v, dict):
+            if set(v.keys()) == {"type", "data"}:
+                return MediaWatcher._unwrap(v["data"])
+            return {k: MediaWatcher._unwrap(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [MediaWatcher._unwrap(x) for x in v]
+        return v
+
+    def _filter_names(self, names):
+        """Filtert die MPRIS-Player nach der gewählten Musikquelle (Desktop-Apps vor Browsern)."""
+        low = lambda n: n.lower()  # noqa: E731
+        if self.source == "Spotify":
+            return [n for n in names if "spotify" in low(n)]
+        if self.source == "YouTube Music":
+            first = [n for n in names if any(k in low(n) for k in YTM_DESKTOP_IDS)]
+            rest = [n for n in names if n not in first and any(k in low(n) for k in YTM_MPRIS_IDS)]
+            return first + rest
+        return names
+
+    def _read_busctl(self):
+        """MPRIS direkt über D-Bus (busctl ist bei systemd-Distros wie Fedora dabei)."""
+        base = ["busctl", "--user"]
+        out = subprocess.run(base + ["--no-legend", "list"], capture_output=True, text=True, timeout=3).stdout
+        names = [ln.split()[0] for ln in out.splitlines() if ln.startswith("org.mpris.MediaPlayer2.")]
+        names = self._filter_names(names)
+        best = None
+        for name in names:
+            res = subprocess.run(
+                base + ["--json=short", "call", name, "/org/mpris/MediaPlayer2",
+                        "org.freedesktop.DBus.Properties", "GetAll", "s", "org.mpris.MediaPlayer2.Player"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if res.returncode != 0:
+                continue
+            data = self._unwrap(json.loads(res.stdout))
+            props = data[0] if isinstance(data, list) and data else data
+            if not isinstance(props, dict):
+                continue
+            md = props.get("Metadata") or {}
+            if not isinstance(md, dict):
+                md = {}
+            artist = md.get("xesam:artist", "")
+            if isinstance(artist, list):
+                artist = ", ".join(str(a) for a in artist)
+            row = [
+                str(props.get("PlaybackStatus", "")),
+                str(md.get("xesam:title", "")),
+                str(artist),
+                str(md.get("xesam:album", "")),
+                str(md.get("mpris:length", 0)),
+                str(props.get("Position", 0)),
+                str(md.get("mpris:artUrl", "")),
+            ]
+            if best is None or row[0] == "Playing":
+                best = row
+            if row[0] == "Playing":
+                break
+        return best
+
+    def _read_playerctl(self):
+        fmt = "{{status}}\t{{title}}\t{{artist}}\t{{album}}\t{{mpris:length}}\t{{position}}\t{{mpris:artUrl}}"
+        players = {"Spotify": "spotify", "YouTube Music": ",".join(YTM_MPRIS_IDS)}.get(self.source)
+        cmd = ["playerctl"] + (["-p", players] if players else []) + ["metadata", "--format", fmt]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.rstrip("\n").split("\t")
+        return None
+
+    def _read_linux(self):
+        if shutil.which("busctl"):
+            try:
+                row = self._read_busctl()
+                if row:
+                    return row
+            except Exception:  # noqa: BLE001
+                pass
+        if shutil.which("playerctl"):
+            try:
+                return self._read_playerctl()
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def _run_linux(self):
+        last_key = None
+        art_version = 0
+        while not self._halt.is_set():
+            parts = self._read_linux()
+
+            if not parts or len(parts) < 7:
+                with self.lock:
+                    self.state.update(active=False, playing=False)
+                last_key = None
+            else:
+                status, title, artist, album, length, position, art_url = parts[:7]
+                artist = re.sub(r"\s*-\s*Topic$", "", artist)
+
+                def to_sec(v):
+                    try:
+                        return max(0.0, int(v) / 1_000_000)
+                    except ValueError:
+                        return 0.0
+
+                key = (title, artist, album)
+                art, art_changed = None, False
+                if key != last_key:
+                    art = self._fetch_art_url(art_url)
+                    art_version += 1
+                    art_changed = True
+                    last_key = key
+                with self.lock:
+                    self.state.update(
+                        active=bool(title or artist),
+                        playing=status.strip().lower() == "playing",
+                        title=title,
+                        artist=artist,
+                        album=album,
+                        pos=to_sec(position),
+                        dur=to_sec(length),
+                        app=self.source,
+                    )
+                    if art_changed:
+                        self.state["art"] = art
+                        self.state["art_version"] = art_version
+            self._halt.wait(0.8)
+
+
     def _pick(self, mgr):
         sessions = list(mgr.get_sessions())
-        for s in sessions:
-            if "spotify" in (s.source_app_user_model_id or "").lower():
-                return s
-        if self.only_spotify:
-            return None
-        return mgr.get_current_session() or (sessions[0] if sessions else None)
+
+        def aumid(sess):
+            return (sess.source_app_user_model_id or "").lower()
+
+        if self.source == "Beliebig":
+            return mgr.get_current_session() or (sessions[0] if sessions else None)
+        if self.source == "Spotify":
+            cands = [x for x in sessions if "spotify" in aumid(x)]
+        else:  # YouTube Music: Desktop-App (bevorzugt) oder Browser-Tab
+            cands = [x for x in sessions if any(k in aumid(x) for k in YTM_DESKTOP_IDS)]
+            cands += [x for x in sessions if x not in cands and any(k in aumid(x) for k in BROWSER_IDS)]
+        for x in cands:  # laufende Wiedergabe hat Vorrang
+            try:
+                if x.get_playback_info().playback_status == PlaybackStatus.PLAYING:
+                    return x
+            except Exception:  # noqa: BLE001
+                pass
+        return cands[0] if cands else None
 
     @staticmethod
     async def _fetch_art(props):
         ref = props.thumbnail
-        if ref is None:
+        if ref is None or not HAS_ART:
             return None
         stream = await ref.open_read_async()
         size = stream.size
@@ -530,7 +801,7 @@ class MediaWatcher(threading.Thread):
                     tl = session.get_timeline_properties()
                     playing = info.playback_status == PlaybackStatus.PLAYING
                     title = props.title or ""
-                    artist = props.artist or ""
+                    artist = re.sub(r"\s*-\s*Topic$", "", props.artist or "")
                     album = props.album_title or ""
                     dur = max(0.0, (tl.end_time - tl.start_time).total_seconds())
                     rep = tl.position.total_seconds()
@@ -580,7 +851,7 @@ class MediaWatcher(threading.Thread):
 # ------------------------------------------------------------------------ App
 class App(ctk.CTk):
     NAV = [
-        ("🎵  Spotify", "spotify"),
+        ("🎵  Musik", "spotify"),
         ("💬  Chatbox", "chat"),
         ("🕐  Uhr", "clock"),
         ("🐾  Furry-Detektor", "furry"),
@@ -599,8 +870,7 @@ class App(ctk.CTk):
         ctk.set_window_scaling(scale)
         super().__init__(fg_color=BG)
         self.title(f"VRC OSC Tool v{APP_VERSION} · {AUTHOR_VRC}")
-        self.geometry("1040x700")
-        self.minsize(920, 620)
+        self._fit_window(1060, 700, 980, 620)
         try:
             self.attributes("-alpha", float(cfg.get("opacity", 1.0)))
         except Exception:  # noqa: BLE001
@@ -622,7 +892,9 @@ class App(ctk.CTk):
         self.auto_job = None
 
         # Spotify-Zustand
-        self.watcher = MediaWatcher(self.cfg["only_spotify"])
+        if self.cfg.get("source") not in SOURCES:
+            self.cfg["source"] = "Spotify" if self.cfg.get("only_spotify", True) else "Beliebig"
+        self.watcher = MediaWatcher(self.cfg["source"])
         self.watcher.start()
         self._art_img = None
         self._art_version = -1
@@ -645,14 +917,60 @@ class App(ctk.CTk):
         self.after(300, self._ui_tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _fit_window(self, w, h, min_w, min_h):
+        """Fenstergröße an Bildschirm und Windows-Skalierung (125 %/150 %) anpassen, zentrieren.
+        customtkinter rechnet geometry()/minsize() mit der Skalierung um, ohne Korrektur wäre das
+        Fenster auf Laptops größer als der Bildschirm und unten abgeschnitten."""
+        try:
+            f = float(self._get_window_scaling())
+        except Exception:  # noqa: BLE001
+            f = 1.0
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = max(640, min(w, int(sw * 0.94 / f)))
+        h = max(480, min(h, int(sh * 0.88 / f)))
+        self.minsize(min(min_w, w), min(min_h, h))
+        x = max(0, int((sw - w * f) / 2))
+        y = max(0, int((sh - h * f) / 2) - 20)
+        self.geometry(f"{w}x{h}+{int(x / f)}+{int(y / f)}")
+
     # ----------------------------------------------------------- Grundlayout
     def _card(self, parent, **kw):
         return ctk.CTkFrame(
             parent, fg_color=CARD, corner_radius=CARD_RADIUS, border_width=1, border_color=TRACK, **kw
         )
 
-    def _h1(self, parent, text):
-        return ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=26, weight="bold"), anchor="w")
+    def _pc(self, key):
+        """Farbe einer Seite (oder die Akzentfarbe, wenn 'Bunte Seiten' aus ist)."""
+        if self.cfg.get("colorful", True) and key in PAGE_COLORS:
+            return PAGE_COLORS[key]
+        return ACCENT
+
+    def _h1(self, parent, text, sub=None):
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkFrame(wrap, width=4, height=1, fg_color=self._pc(getattr(self, "_cur_build", "")), corner_radius=0).pack(side="left", fill="y", padx=(0, 12))
+        col = ctk.CTkFrame(wrap, fg_color="transparent")
+        col.pack(side="left")
+        ctk.CTkLabel(col, text=text.upper(), font=ctk.CTkFont(size=24, weight="bold"), anchor="w").pack(anchor="w")
+        if sub:
+            ctk.CTkLabel(col, text=sub, font=ctk.CTkFont(size=12), text_color=TEXT_DIM, anchor="w").pack(anchor="w")
+        return wrap
+
+    def _panel(self, parent, title):
+        """Karte mit Titelzeile (Akzent-Quadrat + Großbuchstaben). Gibt (karte, inhalt, kopfzeile) zurück."""
+        card = self._card(parent)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 0))
+        head.grid_columnconfigure(1, weight=1)
+        ctk.CTkFrame(head, width=8, height=8, fg_color=self._pc(getattr(self, "_cur_build", "")), corner_radius=0).grid(row=0, column=0, padx=(0, 8))
+        ctk.CTkLabel(
+            head, text=title.upper(), font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_DIM, anchor="w"
+        ).grid(row=0, column=1, sticky="w")
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 14))
+        body.grid_columnconfigure(0, weight=1)
+        return card, body, head
 
     def _h2(self, parent, text):
         return ctk.CTkLabel(
@@ -660,103 +978,110 @@ class App(ctk.CTk):
         )
 
     def _build_layout(self):
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-
-        side = ctk.CTkFrame(self, width=SIDEBAR_W, fg_color=SIDEBAR, corner_radius=0)
-        side.grid(row=0, column=0, sticky="nsew")
-        side.grid_propagate(False)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
         compact = bool(self.cfg.get("compact_sidebar"))
 
-        # Logo-Plakette im VRChat-Stil
-        logo = ctk.CTkFrame(side, fg_color=ACCENT, corner_radius=22, height=44, width=44 if compact else 150)
-        logo.pack(anchor="center" if compact else "w", padx=0 if compact else 18, pady=(24, 4))
+        # ---------- Menüleiste oben (Tabs wie im Tarkov-Hauptmenü)
+        top = ctk.CTkFrame(self, fg_color=SIDEBAR, corner_radius=0, height=62)
+        top.grid(row=0, column=0, sticky="ew")
+        top.pack_propagate(False)
+        logo = ctk.CTkFrame(top, fg_color=ACCENT, corner_radius=INNER_RADIUS, width=44 if compact else 112, height=38)
+        logo.pack(side="left", padx=(18, 8), pady=12)
         logo.pack_propagate(False)
         ctk.CTkLabel(
-            logo, text="VRC" if compact else "VRC OSC", font=ctk.CTkFont(size=18, weight="bold"), text_color=ON_ACCENT
+            logo, text="VRC" if compact else "VRC OSC", font=ctk.CTkFont(size=16, weight="bold"), text_color=ON_ACCENT
         ).pack(expand=True)
-        ctk.CTkLabel(side, text=f"v{APP_VERSION}", font=ctk.CTkFont(size=12), text_color=TEXT_DIM).pack(
-            anchor="center" if compact else "w", padx=0 if compact else 24, pady=(0, 18)
+        ctk.CTkLabel(top, text=f"v{APP_VERSION}", font=ctk.CTkFont(size=11), text_color=TEXT_DIM).pack(
+            side="left", padx=(0, 14)
         )
 
-        self.nav_buttons = {}
+        tabs = ctk.CTkFrame(top, fg_color="transparent")
+        tabs.pack(side="left", fill="y")
+        self.nav_buttons, self.nav_lines = {}, {}
         hidden = set(self.cfg.get("hidden_pages", [])) - {"look", "settings"}
-        for label, key in self.NAV:
+        for _, key in self.NAV:
             if key in hidden:
                 continue
+            icon, name = NAV_SHORT[key]
+            cell = ctk.CTkFrame(tabs, fg_color="transparent")
+            cell.pack(side="left", fill="y", padx=2)
             b = ctk.CTkButton(
-                side,
-                text=label.split()[0] if compact else label,
-                anchor="center" if compact else "w",
-                height=44,
-                corner_radius=22,
+                cell,
+                text=icon if compact else f"{icon}  {name}",
+                width=46 if compact else 38 + 9 * len(name),
+                height=40,
+                corner_radius=INNER_RADIUS,
+                border_width=0,
                 fg_color="transparent",
                 hover_color=NAV_ACTIVE,
-                text_color=TEXT_MAIN,
-                font=ctk.CTkFont(size=14, weight="bold"),
+                text_color=TEXT_SOFT,
+                font=ctk.CTkFont(size=12, weight="bold"),
                 command=lambda k=key: self.show_page(k),
             )
-            b.pack(fill="x", padx=12, pady=3)
+            b.pack(padx=2, pady=(9, 0))
+            line = ctk.CTkFrame(cell, width=1, height=3, fg_color=SIDEBAR, corner_radius=0)
+            line.pack(fill="x", padx=6, pady=(2, 0))
             self.nav_buttons[key] = b
+            self.nav_lines[key] = line
 
-        # Copyright unten in der Seitenleiste
-        self.lbl_copy = ctk.CTkLabel(
-            side,
-            text="©\n:femboii1i" if compact else f"© {time.strftime('%Y')}\nVRChat: {AUTHOR_VRC}\nDiscord: {AUTHOR_DISCORD}",
-            font=ctk.CTkFont(size=10), text_color=TEXT_DIM, justify="center" if compact else "left",
-            anchor="center" if compact else "w",
-        )
-        self.lbl_copy.pack(side="bottom", anchor="center" if compact else "w", padx=0 if compact else 18, pady=(6, 16))
-
-        self.lbl_status = ctk.CTkLabel(
-            side, text="", font=ctk.CTkFont(size=11), text_color=TEXT_DIM, justify="left", anchor="w"
-        )
-        self.lbl_vrc = ctk.CTkLabel(
-            side, text="", font=ctk.CTkFont(size=11), text_color=TEXT_DIM, justify="left", anchor="w"
-        )
-        if not compact:  # in der schmalen Seitenleiste ist kein Platz für die Statustexte
-            self.lbl_status.pack(side="bottom", anchor="w", padx=18, pady=(10, 4))
-            self.lbl_vrc.pack(side="bottom", anchor="w", padx=18)
+        # farbiger Streifen unter der Menüleiste, wechselt mit der Seite
+        self.top_line = ctk.CTkFrame(self, height=2, fg_color=ACCENT, corner_radius=0)
+        self.top_line.grid(row=1, column=0, sticky="ew")
 
         container = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        container.grid(row=0, column=1, sticky="nsew")
+        container.grid(row=2, column=0, sticky="nsew")
         container.grid_columnconfigure(0, weight=1)
         container.grid_rowconfigure(0, weight=1)
 
         self.pages = {}
         for _, key in self.NAV:
             page = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
-            page.grid(row=0, column=0, sticky="nsew", padx=24, pady=20)
+            page.grid(row=0, column=0, sticky="nsew", padx=24, pady=18)
             page.grid_columnconfigure(0, weight=1)
             self.pages[key] = page
 
-        self._build_spotify(self.pages["spotify"])
-        self._build_chat(self.pages["chat"])
-        self._build_clock(self.pages["clock"])
-        self._build_furry(self.pages["furry"])
-        self._build_params(self.pages["params"])
-        self._build_look(self.pages["look"])
-        self._build_monitor(self.pages["monitor"])
-        self._build_settings(self.pages["settings"])
+        for key, build in (
+            ("spotify", self._build_spotify),
+            ("chat", self._build_chat),
+            ("clock", self._build_clock),
+            ("furry", self._build_furry),
+            ("params", self._build_params),
+            ("look", self._build_look),
+            ("monitor", self._build_monitor),
+            ("settings", self._build_settings),
+        ):
+            self._cur_build = key
+            build(self.pages[key])
 
-        self.footer = ctk.CTkLabel(
-            container, text="Bereit.", anchor="w", text_color=TEXT_DIM, font=ctk.CTkFont(size=11)
+        # ---------- Statusleiste unten
+        bar = ctk.CTkFrame(container, fg_color=SIDEBAR, corner_radius=0, height=30)
+        bar.grid(row=1, column=0, sticky="ew")
+        bar.grid_columnconfigure(0, weight=1)
+        small = ctk.CTkFont(size=11)
+        self.footer = ctk.CTkLabel(bar, text="Bereit.", anchor="w", text_color=TEXT_DIM, font=small)
+        self.footer.grid(row=0, column=0, sticky="ew", padx=(20, 8), pady=5)
+        self.lbl_vrc = ctk.CTkLabel(bar, text="", anchor="e", text_color=TEXT_DIM, font=small)
+        self.lbl_vrc.grid(row=0, column=1, sticky="e", padx=8, pady=5)
+        self.lbl_status = ctk.CTkLabel(bar, text="", anchor="e", text_color=TEXT_DIM, font=small)
+        self.lbl_status.grid(row=0, column=2, sticky="e", padx=8, pady=5)
+        ctk.CTkLabel(bar, text=COPYRIGHT_SHORT, anchor="e", text_color=TEXT_DIM, font=small).grid(
+            row=0, column=3, sticky="e", padx=(8, 20), pady=5
         )
-        self.footer.grid(row=1, column=0, sticky="ew", padx=26, pady=(0, 8))
-        ctk.CTkLabel(
-            container, text=COPYRIGHT, anchor="e", text_color=TEXT_DIM, font=ctk.CTkFont(size=11)
-        ).grid(row=1, column=0, sticky="e", padx=26, pady=(0, 8))
-        self._layout_widgets = [side, container]
+        self._layout_widgets = [top, container]
 
     def show_page(self, key):
         self._current_page = key
         self.pages[key].tkraise()
         for k, b in self.nav_buttons.items():
+            on = k == key
             b.configure(
-                fg_color=ACCENT if k == key else "transparent",
-                text_color=ON_ACCENT if k == key else TEXT_MAIN,
-                hover_color=ACCENT_HOVER if k == key else NAV_ACTIVE,
+                fg_color=NAV_ACTIVE if on else "transparent",
+                text_color=self._pc(k) if on else TEXT_SOFT,
+                hover_color=NAV_ACTIVE,
             )
+            self.nav_lines[k].configure(fg_color=self._pc(k) if on else SIDEBAR)
+        self.top_line.configure(fg_color=self._pc(key))
 
     def log(self, msg):
         self.footer.configure(text=f"{time.strftime('%H:%M:%S')}  {msg}")
@@ -764,7 +1089,7 @@ class App(ctk.CTk):
     # --------------------------------------------------------- Spotify-Seite
     def _build_spotify(self, page):
         page.grid_rowconfigure(2, weight=1)
-        self._h1(page, "Spotify · Now Playing").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "Musik · Now Playing", "Aktueller Song automatisch in der Chatbox").grid(row=0, column=0, sticky="w", pady=(0, 12))
 
         np = self._card(page)
         np.grid(row=1, column=0, sticky="ew")
@@ -889,7 +1214,8 @@ class App(ctk.CTk):
         self.pause_mode = ctk.StringVar(value=self.cfg["pause_mode"])
         ctk.CTkSegmentedButton(
             prow, values=["Anzeigen", "Ausblenden"], variable=self.pause_mode, selected_color=ACCENT,
-            selected_hover_color=ACCENT_HOVER, command=lambda v: self._on_template_change(),
+            selected_hover_color=ACCENT_HOVER, text_color=ON_ACCENT, unselected_color=TEXT_DIM,
+            unselected_hover_color=TEXT_SOFT, command=lambda v: self._on_template_change(),
         ).pack(side="left")
 
         self.show_lyrics = ctk.BooleanVar(value=self.cfg["show_lyrics"])
@@ -918,7 +1244,7 @@ class App(ctk.CTk):
     def _send_now(self):
         st = self.watcher.snapshot()
         if not st["active"]:
-            messagebox.showinfo("Hinweis", "In Spotify läuft gerade nichts, deshalb wird nichts gesendet.")
+            messagebox.showinfo("Hinweis", f"In {self.cfg['source']} läuft gerade nichts, deshalb wird nichts gesendet.")
             return
         paused = not st["playing"] and self.pause_mode.get() == "Anzeigen"
         self.chat_send(self._render_chat(st, paused=paused), force=True)
@@ -1033,7 +1359,7 @@ class App(ctk.CTk):
             self.lbl_preview.configure(text=self._render_chat(st, paused=not st["playing"] and self.pause_mode.get() == "Anzeigen"))
         else:
             self.lbl_title.configure(text="Nichts läuft")
-            self.lbl_artist.configure(text="Starte Spotify (Desktop-App) und spiele einen Song." if not st["error"] else "")
+            self.lbl_artist.configure(text={"Spotify": "Starte Spotify (Desktop-App) und spiele einen Song.", "YouTube Music": "Spiele einen Song in YouTube Music (Browser oder Desktop-App)."}.get(self.cfg["source"], "Spiele etwas in einem Mediaplayer ab.") if not st["error"] else "")
             self.lbl_album.configure(text="")
             self.lbl_state.configure(text="")
             self.lbl_pos.configure(text="0:00")
@@ -1054,21 +1380,37 @@ class App(ctk.CTk):
 
     # ---------------------------------------------------------- Chatbox-Seite
     def _build_chat(self, page):
-        page.grid_rowconfigure(2, weight=1)
-        self._h1(page, "Chatbox").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        page.grid_columnconfigure(0, weight=3, uniform="chat")
+        page.grid_columnconfigure(1, weight=2, uniform="chat")
+        page.grid_rowconfigure(1, weight=1)
+        self._h1(page, "Chatbox", "Nachrichten direkt an VRChat senden").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
+        )
 
-        card = self._card(page)
-        card.grid(row=1, column=0, sticky="ew")
-        card.grid_columnconfigure(0, weight=1)
-        self.txt_chat = ctk.CTkTextbox(card, height=110, fg_color=CARD_INNER, corner_radius=INNER_RADIUS, font=ctk.CTkFont(size=14))
-        self.txt_chat.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 4))
+        # ---------- linke Spalte: schreiben, Vorschau, Auto-Wiederholung
+        left = ctk.CTkFrame(page, fg_color="transparent")
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 7))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(3, weight=1)
+
+        card, body, _ = self._panel(left, "Nachricht")
+        card.grid(row=0, column=0, sticky="ew")
+        self.txt_chat = ctk.CTkTextbox(body, height=116, font=ctk.CTkFont(size=14), wrap="word")
+        self.txt_chat.grid(row=0, column=0, sticky="ew")
         self.txt_chat.bind("<KeyRelease>", self._on_chat_key)
         self.txt_chat.bind("<Control-Return>", lambda e: (self._send_chat(), "break")[1])
-        self.lbl_count = ctk.CTkLabel(card, text=f"0/{CHATBOX_LIMIT}", text_color=TEXT_DIM, anchor="e")
-        self.lbl_count.grid(row=1, column=0, sticky="e", padx=22)
 
-        opts = ctk.CTkFrame(card, fg_color="transparent")
-        opts.grid(row=2, column=0, sticky="ew", padx=18, pady=6)
+        counter = ctk.CTkFrame(body, fg_color="transparent")
+        counter.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        counter.grid_columnconfigure(0, weight=1)
+        self.bar_count = ctk.CTkProgressBar(counter, height=4, corner_radius=0, progress_color=ACCENT, fg_color=TRACK)
+        self.bar_count.set(0)
+        self.bar_count.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.lbl_count = ctk.CTkLabel(counter, text=f"0/{CHATBOX_LIMIT}", text_color=TEXT_DIM, font=ctk.CTkFont(size=12))
+        self.lbl_count.grid(row=0, column=1)
+
+        opts = ctk.CTkFrame(body, fg_color="transparent")
+        opts.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         self.var_immediate = ctk.BooleanVar(value=True)
         self.var_sound = ctk.BooleanVar(value=False)
         self.var_typing = ctk.BooleanVar(value=True)
@@ -1079,54 +1421,136 @@ class App(ctk.CTk):
         ):
             ctk.CTkSwitch(opts, text=text, variable=var, progress_color=ACCENT).pack(side="left", padx=(0, 18))
 
-        btns = ctk.CTkFrame(card, fg_color="transparent")
-        btns.grid(row=3, column=0, sticky="ew", padx=18, pady=(6, 6))
+        btns = ctk.CTkFrame(body, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", pady=(14, 0))
         ctk.CTkButton(
-            btns, text="Senden  (Strg+Enter)", fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
-            command=self._send_chat,
+            btns, text="SENDEN", width=130, height=36, fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
+            font=ctk.CTkFont(size=13, weight="bold"), command=self._send_chat,
         ).pack(side="left")
         ctk.CTkButton(
-            btns, text="Chatbox leeren", fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER, command=self._clear_chatbox
+            btns, text="LEEREN", width=100, height=36, font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._clear_chatbox,
         ).pack(side="left", padx=8)
+        ctk.CTkLabel(btns, text="Strg + Enter", text_color=TEXT_DIM, font=ctk.CTkFont(size=11)).pack(side="right")
 
-        auto = ctk.CTkFrame(card, fg_color="transparent")
-        auto.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 16))
+        quick = ctk.CTkFrame(body, fg_color="transparent")
+        quick.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        ctk.CTkLabel(quick, text="SCHNELLTEXTE", text_color=TEXT_DIM, font=ctk.CTkFont(size=10, weight="bold")).pack(
+            anchor="w", pady=(0, 4)
+        )
+        qrow = ctk.CTkFrame(quick, fg_color="transparent")
+        qrow.pack(fill="x")
+        for text in QUICK_TEXTS:
+            ctk.CTkButton(
+                qrow, text=text, height=28, width=10, font=ctk.CTkFont(size=12),
+                command=lambda t=text: self._quick_send(t),
+            ).pack(side="left", padx=(0, 6))
+
+        pcard, pbody, _ = self._panel(left, "Vorschau")
+        pcard.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        bubble = ctk.CTkFrame(pbody, fg_color=CARD_INNER, border_width=1, border_color=TRACK, corner_radius=INNER_RADIUS)
+        bubble.grid(row=0, column=0, sticky="ew")
+        self.lbl_preview = ctk.CTkLabel(
+            bubble, text="", anchor="w", justify="left", wraplength=360, font=ctk.CTkFont(size=14)
+        )
+        self.lbl_preview.pack(fill="x", padx=14, pady=12)
+        ctk.CTkLabel(
+            pbody, text=f"So ungefähr sieht es in VRChat aus (max. {CHATBOX_LIMIT} Zeichen, 9 Zeilen).",
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=11), anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        acard, abody, _ = self._panel(left, "Auto-Wiederholung")
+        acard.grid(row=2, column=0, sticky="ew", pady=(14, 0))
         self.var_auto = ctk.BooleanVar(value=False)
         self.var_auto_interval = ctk.StringVar(value="5")
+        arow = ctk.CTkFrame(abody, fg_color="transparent")
+        arow.grid(row=0, column=0, sticky="w")
         ctk.CTkSwitch(
-            auto, text="Auto-Wiederholung alle", variable=self.var_auto, progress_color=ACCENT, command=self._toggle_auto
+            arow, text="Alle", variable=self.var_auto, progress_color=ACCENT, command=self._toggle_auto, width=70
         ).pack(side="left")
-        ctk.CTkEntry(auto, textvariable=self.var_auto_interval, width=50).pack(side="left", padx=8)
-        ctk.CTkLabel(auto, text="Sekunden (min. 2)", text_color=TEXT_DIM).pack(side="left")
+        ctk.CTkEntry(arow, textvariable=self.var_auto_interval, width=54, justify="center").pack(side="left", padx=8)
+        ctk.CTkLabel(arow, text="Sekunden senden (min. 2)", text_color=TEXT_DIM).pack(side="left")
 
-        hist = self._card(page)
-        hist.grid(row=2, column=0, sticky="nsew", pady=(14, 0))
-        hist.grid_rowconfigure(1, weight=1)
-        hist.grid_columnconfigure(0, weight=1)
-        self._h2(hist, "VERLAUF").grid(row=0, column=0, sticky="w", padx=20, pady=(14, 0))
-        self.hist_frame = ctk.CTkScrollableFrame(hist, fg_color="transparent")
-        self.hist_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 10))
+        # ---------- rechte Spalte: Verlauf
+        hcard, hbody, hhead = self._panel(page, "Verlauf")
+        hcard.grid(row=1, column=1, sticky="nsew", padx=(7, 0))
+        self.lbl_hist_count = ctk.CTkLabel(hhead, text="0", text_color=TEXT_DIM, font=ctk.CTkFont(size=12))
+        self.lbl_hist_count.grid(row=0, column=2, sticky="e")
+        hbody.grid_rowconfigure(0, weight=1)
+        self.hist_frame = ctk.CTkScrollableFrame(hbody, fg_color="transparent")
+        self.hist_frame.grid(row=0, column=0, sticky="nsew")
         self.hist_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(hbody, text="VERLAUF LEEREN", height=30, font=ctk.CTkFont(size=12, weight="bold"),
+                      fg_color=NEUTRAL, hover_color=DANGER, command=self._clear_history).grid(
+            row=1, column=0, sticky="ew", pady=(8, 0)
+        )
+        self._update_preview("")
         self._refresh_history()
 
     def _refresh_history(self):
         for w in self.hist_frame.winfo_children():
             w.destroy()
-        for i, item in enumerate(self.cfg["history"]):
+        hist = self.cfg["history"]
+        self.lbl_hist_count.configure(text=str(len(hist)))
+        if not hist:
+            ctk.CTkLabel(self.hist_frame, text="Noch nichts gesendet.", text_color=TEXT_DIM).grid(
+                row=0, column=0, pady=28
+            )
+            return
+        for i, item in enumerate(hist):
+            row = ctk.CTkFrame(self.hist_frame, fg_color=ROW, corner_radius=INNER_RADIUS)
+            row.grid(row=i, column=0, sticky="ew", pady=3)
+            row.grid_columnconfigure(0, weight=1)
+            short = item.replace("\n", " ⏎ ")
+            if len(short) > 70:
+                short = short[:67] + "…"
+            ctk.CTkLabel(row, text=short, anchor="w", justify="left", wraplength=220, text_color=TEXT_SOFT).grid(
+                row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 2)
+            )
+            acts = ctk.CTkFrame(row, fg_color="transparent")
+            acts.grid(row=1, column=0, columnspan=2, sticky="e", padx=8, pady=(0, 8))
             ctk.CTkButton(
-                self.hist_frame, text=item.replace("\n", " ⏎ "), anchor="w", fg_color=ROW, hover_color=ROW_HOVER,
-                command=lambda t=item: self._history_pick(t),
-            ).grid(row=i, column=0, sticky="ew", pady=2)
+                acts, text="Laden", width=62, height=24, font=ctk.CTkFont(size=11), fg_color=NEUTRAL,
+                hover_color=NEUTRAL_HOVER, command=lambda t=item: self._history_pick(t),
+            ).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(
+                acts, text="Senden", width=62, height=24, font=ctk.CTkFont(size=11), fg_color=ACCENT,
+                hover_color=ACCENT_HOVER, text_color=ON_ACCENT, command=lambda t=item: self._history_send(t),
+            ).pack(side="left")
 
     def _history_pick(self, text):
         self.txt_chat.delete("1.0", "end")
         self.txt_chat.insert("1.0", text)
         self._on_chat_key()
 
+    def _history_send(self, text):
+        self._history_pick(text)
+        self._send_chat()
+
+    def _clear_history(self):
+        self.cfg["history"] = []
+        save_config(self.cfg)
+        self._refresh_history()
+
+    def _quick_send(self, text):
+        self._history_pick(text)
+        self._send_chat()
+
+    def _update_preview(self, text):
+        shown = text[:CHATBOX_LIMIT]
+        if shown.strip():
+            self.lbl_preview.configure(text=shown, text_color=TEXT_LYRIC)
+        else:
+            self.lbl_preview.configure(text="Noch nichts eingegeben.", text_color=TEXT_DIM)
+
     def _on_chat_key(self, _event=None):
         text = self.txt_chat.get("1.0", "end-1c")
         n = len(text)
-        self.lbl_count.configure(text=f"{n}/{CHATBOX_LIMIT}", text_color=DANGER if n > CHATBOX_LIMIT else TEXT_DIM)
+        over = n > CHATBOX_LIMIT
+        self.lbl_count.configure(text=f"{n}/{CHATBOX_LIMIT}", text_color=DANGER if over else TEXT_DIM)
+        self.bar_count.set(min(n / CHATBOX_LIMIT, 1.0))
+        self.bar_count.configure(progress_color=DANGER if over else ACCENT)
+        self._update_preview(text)
         if self.var_typing.get() and self.client:
             self.client.send_message("/chatbox/typing", bool(text))
 
@@ -1166,7 +1590,7 @@ class App(ctk.CTk):
         hist.insert(0, text)
         del hist[20:]
         save_config(self.cfg)
-        self._refresh_history()
+        self.after(250, self._refresh_history)
 
     def _clear_chatbox(self):
         self.chat_send("", force=True)
@@ -1194,7 +1618,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------- Aussehen-Seite
     def _build_look(self, page):
         page.grid_rowconfigure(1, weight=1)
-        self._h1(page, "Aussehen").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "Aussehen", "Farben, Rundung, Skalierung").grid(row=0, column=0, sticky="w", pady=(0, 12))
         scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
         scroll.grid(row=1, column=0, sticky="nsew")
         scroll.grid_columnconfigure(0, weight=1)
@@ -1207,16 +1631,34 @@ class App(ctk.CTk):
             opacity=ctk.DoubleVar(value=float(self.cfg["opacity"])),
             compact=ctk.BooleanVar(value=bool(self.cfg["compact_sidebar"])),
             hidden=set(self.cfg.get("hidden_pages", [])),
+            colorful=ctk.BooleanVar(value=bool(self.cfg.get("colorful", True))),
         )
 
         # --- Farbschema
         c1 = self._card(scroll)
         c1.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         self._h2(c1, "FARBSCHEMA").pack(anchor="w", padx=20, pady=(14, 6))
-        ctk.CTkSegmentedButton(
-            c1, values=list(PALETTES), variable=self._look["palette"], selected_color=ACCENT,
-            selected_hover_color=ACCENT_HOVER, text_color=ON_ACCENT,
-        ).pack(anchor="w", padx=20, pady=(0, 16))
+        self._pal_chips = {}
+        grid_p = ctk.CTkFrame(c1, fg_color="transparent")
+        grid_p.pack(anchor="w", padx=20, pady=(0, 16))
+        for i, (pname, pal) in enumerate(PALETTES.items()):
+            chip = ctk.CTkFrame(
+                grid_p, width=148, height=62, fg_color=pal["CARD"], border_width=2, corner_radius=INNER_RADIUS,
+                border_color=ACCENT if pname == self._look["palette"].get() else pal["TRACK"],
+            )
+            chip.grid(row=i // 5, column=i % 5, padx=4, pady=4)
+            chip.pack_propagate(False)
+            lbl = ctk.CTkLabel(
+                chip, text=pname.upper(), font=ctk.CTkFont(size=12, weight="bold"), text_color=pal["TEXT_MAIN"], anchor="w"
+            )
+            lbl.pack(anchor="w", padx=10, pady=(8, 4))
+            sw = ctk.CTkFrame(chip, fg_color="transparent")
+            sw.pack(anchor="w", padx=10)
+            for col in (pal["BG"], pal["NEUTRAL"], pal["TRACK"], PAL_ACCENT.get(pname, ACCENT)):
+                ctk.CTkFrame(sw, width=22, height=10, fg_color=col, corner_radius=0).pack(side="left", padx=(0, 3))
+            for wdg in (chip, lbl, sw):
+                wdg.bind("<Button-1>", lambda e, n=pname: self._select_palette(n))
+            self._pal_chips[pname] = chip
 
         # --- Akzentfarbe
         c2 = self._card(scroll)
@@ -1224,11 +1666,11 @@ class App(ctk.CTk):
         self._h2(c2, "AKZENTFARBE").pack(anchor="w", padx=20, pady=(14, 6))
         swatches = ctk.CTkFrame(c2, fg_color="transparent")
         swatches.pack(anchor="w", padx=20)
-        for name, hexv in ACCENTS.items():
+        for i, (name, hexv) in enumerate(ACCENTS.items()):
             ctk.CTkButton(
                 swatches, text="", width=34, height=34, corner_radius=17, fg_color=hexv, hover_color=lighten(hexv),
                 border_width=2, border_color=CARD, command=lambda h=hexv: self._pick_accent(h),
-            ).pack(side="left", padx=3)
+            ).grid(row=i // 10, column=i % 10, padx=3, pady=3)
         hexrow = ctk.CTkFrame(c2, fg_color="transparent")
         hexrow.pack(anchor="w", padx=20, pady=(10, 16))
         ctk.CTkLabel(hexrow, text="Eigene Farbe (Hex):").pack(side="left")
@@ -1243,18 +1685,22 @@ class App(ctk.CTk):
         c3.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         c3.grid_columnconfigure(1, weight=1)
         self._h2(c3, "FORM & GRÖSSE").grid(row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(14, 6))
-        self._look_slider(c3, 1, "Rundung", self._look["radius"], 4, 30, 26, lambda v: f"{int(v)} px")
+        self._look_slider(c3, 1, "Rundung", self._look["radius"], 0, 30, 30, lambda v: f"{int(v)} px")
         self._look_slider(c3, 2, "UI-Größe", self._look["scale"], 0.8, 1.4, 12, lambda v: f"{int(round(v * 100))} %")
         self._look_slider(c3, 3, "Deckkraft", self._look["opacity"], 0.5, 1.0, 10, lambda v: f"{int(round(v * 100))} %",
                           live=lambda v: self.attributes("-alpha", float(v)))
         ctk.CTkSwitch(
-            c3, text="Schmale Seitenleiste (nur Symbole)", variable=self._look["compact"], progress_color=ACCENT
-        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=20, pady=(8, 16))
+            c3, text="Nur Symbole in der Menüleiste", variable=self._look["compact"], progress_color=ACCENT
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=20, pady=(8, 8))
+        ctk.CTkSwitch(
+            c3, text="Bunte Seiten (jede Seite hat ihre eigene Farbe)", variable=self._look["colorful"],
+            progress_color=ACCENT,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=20, pady=(0, 16))
 
         # --- Seiten ein-/ausblenden
         c4 = self._card(scroll)
         c4.grid(row=3, column=0, sticky="ew", pady=(0, 12))
-        self._h2(c4, "SEITEN IN DER SEITENLEISTE").pack(anchor="w", padx=20, pady=(14, 6))
+        self._h2(c4, "SEITEN IN DER MENÜLEISTE").pack(anchor="w", padx=20, pady=(14, 6))
         grid = ctk.CTkFrame(c4, fg_color="transparent")
         grid.pack(anchor="w", padx=20, pady=(0, 16))
         for i, (label, key) in enumerate(self.NAV):
@@ -1297,6 +1743,13 @@ class App(ctk.CTk):
         ).grid(row=row, column=1, sticky="ew", pady=6)
         val.grid(row=row, column=2, padx=(10, 20))
 
+    def _select_palette(self, name):
+        self._look["palette"].set(name)
+        for n, chip in self._pal_chips.items():
+            chip.configure(border_color=ACCENT if n == name else PALETTES[n]["TRACK"])
+        if name in PAL_ACCENT:
+            self._pick_accent(PAL_ACCENT[name])
+
     def _pick_accent(self, hexv):
         self._look["accent"].set(hexv)
         self._update_accent_preview()
@@ -1329,6 +1782,7 @@ class App(ctk.CTk):
             opacity=round(float(self._look["opacity"].get()), 2),
             compact_sidebar=bool(self._look["compact"].get()),
             hidden_pages=sorted(self._look["hidden"]),
+            colorful=bool(self._look["colorful"].get()),
         )
         self.cfg["template"] = self.txt_template.get("1.0", "end-1c")
         self.cfg["clock_template"] = self.txt_clock.get("1.0", "end-1c")
@@ -1337,13 +1791,13 @@ class App(ctk.CTk):
     def _reset_look(self):
         if not messagebox.askyesno("Zurücksetzen", "Aussehen auf Standard zurücksetzen?"):
             return
-        for k in ("palette", "accent", "card_radius", "ui_scale", "opacity", "compact_sidebar", "hidden_pages"):
+        for k in ("palette", "accent", "card_radius", "ui_scale", "opacity", "compact_sidebar", "hidden_pages", "colorful"):
             self.cfg[k] = DEFAULT_CONFIG[k]
         self._restart("look")
 
     # --------------------------------------------------------------- Uhr-Seite
     def _build_clock(self, page):
-        self._h1(page, "Uhr").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "Uhr", "Uhrzeit und Datum als Chatbox-Text").grid(row=0, column=0, sticky="w", pady=(0, 12))
         card = self._card(page)
         card.grid(row=1, column=0, sticky="ew")
         card.grid_columnconfigure(0, weight=1)
@@ -1395,7 +1849,7 @@ class App(ctk.CTk):
     # -------------------------------------------------------- Furry-Detektor
     def _build_furry(self, page):
         page.grid_rowconfigure(2, weight=1)
-        self._h1(page, "Furry-Detektor 🐾").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "Furry-Detektor 🐾", "Den Flauschfaktor messen").grid(row=0, column=0, sticky="w", pady=(0, 12))
 
         card = self._card(page)
         card.grid(row=1, column=0, sticky="ew")
@@ -1480,7 +1934,7 @@ class App(ctk.CTk):
     # --------------------------------------------------------- Parameter-Seite
     def _build_params(self, page):
         page.grid_rowconfigure(2, weight=1)
-        self._h1(page, "Avatar-Parameter").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "Avatar-Parameter", "Parameter per OSC an den Avatar senden").grid(row=0, column=0, sticky="w", pady=(0, 12))
 
         card = self._card(page)
         card.grid(row=1, column=0, sticky="ew")
@@ -1497,7 +1951,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(card, text="Typ").grid(row=1, column=0, padx=(18, 8), pady=6, sticky="e")
         ctk.CTkSegmentedButton(
             card, values=["bool", "int", "float"], variable=self.var_ptype, selected_color=ACCENT,
-            selected_hover_color=ACCENT_HOVER, command=self._on_type_change,
+            selected_hover_color=ACCENT_HOVER, text_color=ON_ACCENT, unselected_color=TEXT_DIM,
+            unselected_hover_color=TEXT_SOFT, command=self._on_type_change,
         ).grid(row=1, column=1, sticky="w", pady=6)
         ctk.CTkLabel(card, text="Wert").grid(row=2, column=0, padx=(18, 8), pady=6, sticky="e")
         ctk.CTkEntry(card, textvariable=self.var_pvalue, width=140).grid(row=2, column=1, sticky="w", pady=6)
@@ -1607,7 +2062,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------ Monitor-Seite
     def _build_monitor(self, page):
         page.grid_rowconfigure(2, weight=1)
-        self._h1(page, "OSC-Monitor").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "OSC-Monitor", "Eingehende Nachrichten live ansehen").grid(row=0, column=0, sticky="w", pady=(0, 12))
 
         bar = self._card(page)
         bar.grid(row=1, column=0, sticky="ew")
@@ -1664,7 +2119,7 @@ class App(ctk.CTk):
 
     # -------------------------------------------------------- Einstellungen
     def _build_settings(self, page):
-        self._h1(page, "Einstellungen").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._h1(page, "Einstellungen", "Verbindung, Musikquelle und Optionen").grid(row=0, column=0, sticky="w", pady=(0, 12))
         card = self._card(page)
         card.grid(row=1, column=0, sticky="ew")
         card.grid_columnconfigure(1, weight=1)
@@ -1683,11 +2138,13 @@ class App(ctk.CTk):
                 row=i, column=1, sticky="w", pady=8 if i else (18, 8)
             )
 
-        self.var_only_spotify = ctk.BooleanVar(value=self.cfg["only_spotify"])
-        ctk.CTkSwitch(
-            card, text="Nur Spotify als Quelle (aus = beliebiger Mediaplayer)", variable=self.var_only_spotify,
-            progress_color=ACCENT,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=8)
+        self.var_source = ctk.StringVar(value=self.cfg["source"])
+        ctk.CTkLabel(card, text="Musikquelle").grid(row=3, column=0, padx=(18, 12), pady=8, sticky="e")
+        ctk.CTkSegmentedButton(
+            card, values=list(SOURCES), variable=self.var_source, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER, text_color=ON_ACCENT, unselected_color=TEXT_DIM,
+            unselected_hover_color=TEXT_SOFT,
+        ).grid(row=3, column=1, sticky="w", pady=8)
 
         self.ascii_mode = ctk.BooleanVar(value=self.cfg["ascii_mode"])
         ctk.CTkSwitch(
@@ -1714,6 +2171,7 @@ class App(ctk.CTk):
             text_color=TEXT_DIM,
             text=(
                 "VRChat: Action Menu → Options → OSC → Enabled.\n"
+                "YouTube Music: läuft in Chrome/Edge/Firefox & Co. oder als Desktop-App (Mediensteuerung muss aktiv sein).\n"
                 "Standard-Ports: 9000 (VRChat empfängt) und 9001 (VRChat sendet).\n"
                 f"Konfiguration: {CONFIG_FILE}"
             ),
@@ -1755,8 +2213,8 @@ class App(ctk.CTk):
             return
 
         self.client = SimpleUDPClient(ip, sp)
-        self.cfg.update(ip=ip, send_port=sp, recv_port=rp, only_spotify=bool(self.var_only_spotify.get()))
-        self.watcher.only_spotify = self.cfg["only_spotify"]
+        self.cfg.update(ip=ip, send_port=sp, recv_port=rp, source=self.var_source.get())
+        self.watcher.source = self.cfg["source"]
         save_config(self.cfg)
 
         self._stop_server()
@@ -1765,11 +2223,11 @@ class App(ctk.CTk):
             disp.set_default_handler(self._on_osc)
             self.server = ThreadingOSCUDPServer(("0.0.0.0", rp), disp)
             threading.Thread(target=self.server.serve_forever, daemon=True).start()
-            self.lbl_status.configure(text=f"● Senden → {ip}:{sp}\n● Empfang  :{rp}", text_color=ACCENT)
+            self.lbl_status.configure(text=f"● Senden → {ip}:{sp}   ● Empfang :{rp}", text_color=ACCENT)
         except OSError as e:
             self.server = None
             self.lbl_status.configure(
-                text=f"● Senden → {ip}:{sp}\n● Empfang FEHLER\n  ({e.strerror or e})", text_color=WARN
+                text=f"● Senden → {ip}:{sp}   ● Empfang FEHLER ({e.strerror or e})", text_color=WARN
             )
 
     def _on_osc(self, addr, *args):
