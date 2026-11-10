@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Startet das VRC OSC Tool (legt beim ersten Mal automatisch eine venv an)
+# Startet das VRC OSC Tool unter Linux (legt beim ersten Mal automatisch eine venv an)
 set -e
 cd "$(dirname "$0")"
 if [ ! -d .venv ]; then
